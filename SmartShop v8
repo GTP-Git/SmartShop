@@ -1,0 +1,932 @@
+package com.example.smartshop // <--- KEEP YOUR ORIGINAL PACKAGE NAME
+
+import android.Manifest
+import android.app.Application
+import android.content.pm.PackageManager
+import android.graphics.Paint
+import android.graphics.Typeface
+import android.os.Bundle
+import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.PopupProperties
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavHostController
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
+
+// Explicit Room Imports
+import androidx.room.*
+
+import com.google.ai.client.generativeai.GenerativeModel
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.common.InputImage
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import retrofit2.Retrofit
+import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.GET
+import retrofit2.http.Path
+
+import androidx.compose.ui.graphics.Path as ComposePath
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Executors
+
+// --- HELPER FUNCTIONS ---
+
+fun getPricePerOz(totalPrice: Double, qty: Double, unit: String): Double {
+    if (qty <= 0) return 0.0
+    val factor = when (unit.lowercase()) {
+        "oz" -> 1.0
+        "lb" -> 16.0
+        "g" -> 0.035274
+        "kg" -> 35.274
+        "ml" -> 0.033814
+        "l" -> 33.814
+        "gal" -> 128.0
+        else -> 1.0
+    }
+    return totalPrice / (qty * factor)
+}
+
+fun calculateMedian(list: List<Double>): Double {
+    if (list.isEmpty()) return 0.0
+    val sorted = list.sorted()
+    return if (sorted.size % 2 == 0) {
+        (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
+    } else {
+        sorted[sorted.size / 2]
+    }
+}
+
+fun parseQuantityAndUnit(rawString: String, validUnits: List<String>): Pair<String, String>? {
+    val regex = Regex("([0-9.]+)\\s*([a-zA-Z]+)")
+    val matches = regex.findAll(rawString.lowercase()).toList()
+    for (match in matches) {
+        val candidateQ = match.groupValues[1]
+        val parsedUnit = match.groupValues[2]
+        val mappedUnit = when {
+            parsedUnit.contains("oz") || parsedUnit.contains("ounce") || parsedUnit == "fl" -> "oz"
+            parsedUnit.contains("lb") || parsedUnit.contains("pound") -> "lb"
+            parsedUnit == "g" || parsedUnit.contains("gram") -> "g"
+            parsedUnit == "kg" || parsedUnit.contains("kilo") -> "kg"
+            parsedUnit.contains("ml") || parsedUnit.contains("milli") -> "ml"
+            parsedUnit == "l" || parsedUnit == "liter" || parsedUnit == "liters" -> "l"
+            parsedUnit.contains("gal") -> "gal"
+            else -> parsedUnit
+        }
+        if (validUnits.contains(mappedUnit)) return Pair(candidateQ, mappedUnit)
+    }
+    return null
+}
+
+// --- 1. APIs ---
+
+data class OFFProductResponse(val product: OFFProduct?)
+data class OFFProduct(val product_name: String?, val quantity: String?)
+interface OpenFoodFactsApi {
+    @GET("api/v0/product/{barcode}.json")
+    suspend fun getProduct(@Path("barcode") barcode: String): OFFProductResponse
+}
+
+data class UpcResponse(val code: String?, val items: List<UpcItem>?)
+data class UpcItem(val title: String?, val size: String?, val weight: String?)
+interface UpcItemDbApi {
+    @GET("prod/trial/lookup")
+    suspend fun getProduct(@retrofit2.http.Query("upc") upc: String): UpcResponse
+}
+
+object RetrofitClient {
+    val offApi: OpenFoodFactsApi by lazy {
+        Retrofit.Builder().baseUrl("https://world.openfoodfacts.org/").addConverterFactory(GsonConverterFactory.create()).build().create(OpenFoodFactsApi::class.java)
+    }
+    val upcApi: UpcItemDbApi by lazy {
+        Retrofit.Builder().baseUrl("https://api.upcitemdb.com/").addConverterFactory(GsonConverterFactory.create()).build().create(UpcItemDbApi::class.java)
+    }
+}
+
+// --- 2. DATABASE ---
+
+@Entity(tableName = "prices")
+data class PriceEntry(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val name: String,
+    val totalPrice: Double,
+    val quantity: Double,
+    val unit: String,
+    val date: Long,
+    val barcode: String? = null,
+    val store: String = ""
+)
+
+@Entity(tableName = "shopping_list")
+data class ShoppingItem(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val name: String,
+    val isChecked: Boolean = false
+)
+
+@Dao
+interface PriceDao {
+    @Insert suspend fun insert(entry: PriceEntry)
+    @Update suspend fun update(entry: PriceEntry)
+    @Delete suspend fun delete(entry: PriceEntry)
+    @Query("SELECT * FROM prices ORDER BY date DESC") fun getAllPrices(): Flow<List<PriceEntry>>
+    @Query("SELECT * FROM prices WHERE id = :id LIMIT 1") suspend fun getEntryById(id: Int): PriceEntry?
+    @Query("SELECT * FROM prices WHERE name LIKE '%' || :query || '%' ORDER BY date DESC") fun searchPrices(query: String): Flow<List<PriceEntry>>
+    @Query("SELECT * FROM prices WHERE LOWER(name) = LOWER(:productName) OR barcode = :productName ORDER BY date ASC")
+    fun getHistoryForProduct(productName: String): Flow<List<PriceEntry>>
+    @Query("SELECT DISTINCT name FROM prices WHERE name LIKE '%' || :query || '%' LIMIT 5")
+    fun getSuggestedNames(query: String): Flow<List<String>>
+    @Query("SELECT * FROM prices WHERE name = :name OR barcode = :name ORDER BY date DESC LIMIT 1")
+    suspend fun getLastEntryForName(name: String): PriceEntry?
+    @Query("DELETE FROM prices") suspend fun deleteAllPrices()
+    @Query("SELECT store FROM prices WHERE store != '' ORDER BY date DESC LIMIT 1")
+    suspend fun getLastUsedStore(): String?
+    @Query("SELECT name, date FROM prices ORDER BY name ASC, date ASC")
+    suspend fun getProductPurchaseHistory(): List<ProductDate>
+
+    // Shopping List Queries
+    @Insert suspend fun insertShoppingItem(item: ShoppingItem)
+    @Update suspend fun updateShoppingItem(item: ShoppingItem)
+    @Delete suspend fun deleteShoppingItem(item: ShoppingItem)
+    @Query("SELECT * FROM shopping_list ORDER BY isChecked ASC, id DESC")
+    fun getShoppingList(): Flow<List<ShoppingItem>>
+    @Query("DELETE FROM shopping_list WHERE isChecked = 1")
+    suspend fun clearCheckedShoppingItems()
+}
+
+data class ProductDate(val name: String, val date: Long)
+
+@Database(entities = [PriceEntry::class, ShoppingItem::class], version = 5)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun priceDao(): PriceDao
+    companion object {
+        @Volatile var INSTANCE: AppDatabase? = null
+        fun getDatabase(context: android.content.Context): AppDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, "shop_db")
+                    .fallbackToDestructiveMigration()
+                    .build()
+                INSTANCE = instance
+                instance
+            }
+        }
+    }
+}
+
+// --- 3. VIEWMODEL ---
+class PriceViewModel(application: Application) : AndroidViewModel(application) {
+    private val db = AppDatabase.getDatabase(application)
+    private val searchQuery = MutableStateFlow("")
+
+    private var generativeModel = GenerativeModel(
+        modelName = "gemini-2.5-flash", // <--- 2.5 Flash set as default
+        apiKey = Secrets.GEMINI_API_KEY.trim()
+    )
+
+    var aiResponse by mutableStateOf<String?>(null)
+    var isAiLoading by mutableStateOf(false)
+    var lastUsedStore by mutableStateOf("")
+
+    var suggestedRestocks by mutableStateOf<List<String>>(emptyList())
+    val shoppingList = db.priceDao().getShoppingList()
+
+    init {
+        viewModelScope.launch {
+            lastUsedStore = db.priceDao().getLastUsedStore() ?: ""
+            calculateRestockSuggestions()
+        }
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val filteredPrices = searchQuery.flatMapLatest { query ->
+        if (query.isEmpty()) db.priceDao().getAllPrices() else db.priceDao().searchPrices(query)
+    }
+
+    fun setSearchQuery(query: String) { searchQuery.value = query }
+    fun getHistoryForProduct(name: String) = db.priceDao().getHistoryForProduct(name)
+    fun getSuggestedNames(query: String) = db.priceDao().getSuggestedNames(query)
+    suspend fun getEntryById(id: Int) = db.priceDao().getEntryById(id)
+    suspend fun getLastEntryForName(name: String) = db.priceDao().getLastEntryForName(name)
+
+    fun saveOrUpdatePrice(id: Int, name: String, p: String, q: String, u: String, d: Long, b: String?, store: String) {
+        val entry = PriceEntry(id, name, p.toDoubleOrNull() ?: 0.0, q.toDoubleOrNull() ?: 1.0, u, d, b, store)
+        lastUsedStore = store
+        viewModelScope.launch {
+            if (id == 0) db.priceDao().insert(entry) else db.priceDao().update(entry)
+            calculateRestockSuggestions()
+        }
+    }
+
+    fun deletePrice(entry: PriceEntry) { viewModelScope.launch { db.priceDao().delete(entry) } }
+    fun deleteAllPrices() { viewModelScope.launch { db.priceDao().deleteAllPrices() } }
+
+    fun addItemToList(name: String) {
+        viewModelScope.launch { db.priceDao().insertShoppingItem(ShoppingItem(name = name)) }
+    }
+    fun toggleShoppingItem(item: ShoppingItem) {
+        viewModelScope.launch { db.priceDao().updateShoppingItem(item.copy(isChecked = !item.isChecked)) }
+    }
+    fun deleteShoppingItem(item: ShoppingItem) {
+        viewModelScope.launch { db.priceDao().deleteShoppingItem(item) }
+    }
+    fun clearCheckedItems() {
+        viewModelScope.launch { db.priceDao().clearCheckedShoppingItems() }
+    }
+
+    suspend fun calculateRestockSuggestions() {
+        val history = db.priceDao().getProductPurchaseHistory()
+        if (history.isEmpty()) return
+
+        val now = System.currentTimeMillis()
+        val suggestions = mutableListOf<String>()
+        val grouped = history.groupBy({ it.name }, { it.date })
+
+        grouped.forEach { (name, dates) ->
+            if (dates.size >= 2) {
+                val sorted = dates.sorted()
+                val totalDays = (sorted.last() - sorted.first()) / (1000 * 60 * 60 * 24)
+                val avgInterval = totalDays.toDouble() / (dates.size - 1)
+                val daysSinceLast = (now - sorted.last()) / (1000 * 60 * 60 * 24)
+
+                if (daysSinceLast >= (avgInterval - 1)) {
+                    suggestions.add(name)
+                }
+            }
+        }
+        suggestedRestocks = suggestions
+    }
+
+    suspend fun fetchProduct(barcode: String): Pair<String?, String?> {
+        var name: String? = null
+        var size: String? = null
+        try {
+            val upcRes = RetrofitClient.upcApi.getProduct(barcode)
+            if (!upcRes.items.isNullOrEmpty()) {
+                name = upcRes.items[0].title
+                size = upcRes.items[0].size ?: upcRes.items[0].weight
+            }
+        } catch (e: Exception) { Log.e("SmartShop", "UPC API failed") }
+        if (name.isNullOrBlank()) {
+            try {
+                val offRes = RetrofitClient.offApi.getProduct(barcode)
+                name = offRes.product?.product_name
+                size = offRes.product?.quantity
+            } catch (e: Exception) { Log.e("SmartShop", "OFF API failed") }
+        }
+        return Pair(name, size)
+    }
+
+    fun getAiShoppingTip() {
+        viewModelScope.launch {
+            isAiLoading = true
+            aiResponse = "Thinking..."
+            try {
+                val history = db.priceDao().getAllPrices().first()
+                if (history.isEmpty()) {
+                    aiResponse = "Add some price entries first!"
+                } else {
+                    val historyText = history.take(25).joinToString(" | ") {
+                        val unitPrice = getPricePerOz(it.totalPrice, it.quantity, it.unit)
+                        "${it.name} at ${it.store}: $${String.format("%.2f", unitPrice)}/oz"
+                    }
+                    val prompt = "User History: $historyText. Based ONLY on this, give a specific, blunt budget observation about where to buy a specific item or which item is costing too much. Quantify the price difference."
+
+                    val response = generativeModel.generateContent(prompt)
+                    aiResponse = response.text?.replace("\n", " ") ?: "AI empty response."
+                }
+            } catch (e: Exception) {
+                Log.e("SmartShop", "AI Error", e)
+                aiResponse = "AI Error: ${e.localizedMessage}"
+            } finally {
+                isAiLoading = false
+            }
+        }
+    }
+}
+
+// --- 4. UI ---
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme {
+                val navController = rememberNavController()
+                val vm: PriceViewModel = viewModel()
+
+                var activeScanner by remember { mutableStateOf("") }
+                var scannedCodeEntry by remember { mutableStateOf<String?>(null) }
+                var scannedCodeCompareA by remember { mutableStateOf<String?>(null) }
+                var scannedCodeCompareB by remember { mutableStateOf<String?>(null) }
+
+                NavHost(navController, startDestination = "main") {
+                    composable("main") { MainScreen(navController, vm) }
+                    composable("shopping_list") { ShoppingListScreen(navController, vm) }
+                    composable("entry?entryId={entryId}", arguments = listOf(navArgument("entryId") { type = NavType.IntType; defaultValue = 0 })) { backStackEntry ->
+                        EntryScreen(navController, vm, scannedCodeEntry, backStackEntry.arguments?.getInt("entryId") ?: 0, { scannedCodeEntry = null }, { activeScanner = "entry"; navController.navigate("scanner") })
+                    }
+                    composable("compare") {
+                        CompareScreen(navController, vm, scannedCodeCompareA, scannedCodeCompareB, { scannedCodeCompareA = null }, { scannedCodeCompareB = null }, { target -> activeScanner = target; navController.navigate("scanner") })
+                    }
+                    composable("options") { OptionsScreen(navController, vm) }
+                    composable("scanner") {
+                        ScannerScreen { code ->
+                            when (activeScanner) {
+                                "entry" -> scannedCodeEntry = code
+                                "compareA" -> scannedCodeCompareA = code
+                                "compareB" -> scannedCodeCompareB = code
+                            }
+                            navController.popBackStack()
+                        }
+                    }
+                    composable("chart/{productName}") { backStackEntry ->
+                        PriceChartScreen(navController, vm, backStackEntry.arguments?.getString("productName") ?: "")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MainScreen(navController: NavHostController, vm: PriceViewModel) {
+    LaunchedEffect(Unit) { vm.calculateRestockSuggestions() }
+
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("Smart Shop") }, actions = {
+            IconButton(onClick = { navController.navigate("options") }) {
+                Icon(imageVector = Icons.Default.Settings, contentDescription = "Settings")
+            }
+        }) },
+        bottomBar = {
+            BottomAppBar(containerColor = MaterialTheme.colorScheme.surfaceVariant) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    TextButton(onClick = { navController.navigate("shopping_list") }) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(imageVector = Icons.Default.List, contentDescription = "Shopping List")
+                            Text("Shopping List", fontSize = 12.sp)
+                        }
+                    }
+                    TextButton(onClick = { navController.navigate("compare") }) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(imageVector = Icons.Default.Refresh, contentDescription = "Compare")
+                            Text("Compare", fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+    ) { p ->
+        Column(modifier = Modifier.fillMaxSize().padding(p).padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+
+            Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("AI Shopping Assistant", fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    if (vm.isAiLoading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    else Text(vm.aiResponse ?: "Get a tip based on your history.", style = MaterialTheme.typography.bodyMedium)
+                    Button(onClick = { vm.getAiShoppingTip() }, modifier = Modifier.align(Alignment.End), enabled = !vm.isAiLoading) {
+                        Text("Get AI Tip")
+                    }
+                }
+            }
+
+            if (vm.suggestedRestocks.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(24.dp))
+                Text("Suggested Restocks", modifier = Modifier.align(Alignment.Start), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                LazyRow(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(vm.suggestedRestocks) { item ->
+                        AssistChip(
+                            onClick = { vm.addItemToList(item) },
+                            label = { Text(item) },
+                            leadingIcon = { Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.weight(1f))
+            Button(onClick = { navController.navigate("entry?entryId=0") }, modifier = Modifier.size(140.dp), shape = MaterialTheme.shapes.extraLarge) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(imageVector = Icons.Default.Add, contentDescription = null, modifier = Modifier.size(48.dp))
+                    Text("Add Price")
+                }
+            }
+            Spacer(modifier = Modifier.weight(1f))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ShoppingListScreen(navController: NavHostController, vm: PriceViewModel) {
+    val items by vm.shoppingList.collectAsState(initial = emptyList())
+    var newItemName by remember { mutableStateOf("") }
+
+    Scaffold(topBar = {
+        TopAppBar(
+            title = { Text("Shopping List") },
+            navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back") } },
+            actions = { IconButton(onClick = { vm.clearCheckedItems() }) { Icon(imageVector = Icons.Default.Check, contentDescription = "Clear Checked", tint = Color.Gray) } }
+        )
+    }) { p ->
+        Column(modifier = Modifier.fillMaxSize().padding(p).padding(16.dp)) {
+            OutlinedTextField(
+                value = newItemName,
+                onValueChange = { newItemName = it },
+                label = { Text("Add item...") },
+                modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = {
+                    if (newItemName.isNotBlank()) { vm.addItemToList(newItemName); newItemName = "" }
+                }),
+                trailingIcon = { IconButton(onClick = { if (newItemName.isNotBlank()) { vm.addItemToList(newItemName); newItemName = "" } }) { Icon(imageVector = Icons.Default.Add, contentDescription = "Add") } }
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                items(items) { item ->
+                    ListItem(
+                        headlineContent = {
+                            Text(
+                                item.name,
+                                textDecoration = if (item.isChecked) TextDecoration.LineThrough else null,
+                                color = if (item.isChecked) Color.Gray else Color.Unspecified
+                            )
+                        },
+                        leadingContent = { Checkbox(checked = item.isChecked, onCheckedChange = { vm.toggleShoppingItem(item) }) },
+                        trailingContent = { IconButton(onClick = { vm.deleteShoppingItem(item) }) { Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = Color.LightGray) } }
+                    )
+                    HorizontalDivider()
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun CompareScreen(navController: NavHostController, vm: PriceViewModel, scannedA: String?, scannedB: String?, onClearA: () -> Unit, onClearB: () -> Unit, onScan: (String) -> Unit) {
+    val unitsList = listOf("oz", "lb", "g", "kg", "ml", "l", "gal", "count")
+
+    var nameA by remember { mutableStateOf("") }
+    var priceA by remember { mutableStateOf("") }
+    var qtyA by remember { mutableStateOf("") }
+    var unitA by remember { mutableStateOf("oz") }
+    var expandedA by remember { mutableStateOf(false) }
+
+    var nameB by remember { mutableStateOf("") }
+    var priceB by remember { mutableStateOf("") }
+    var qtyB by remember { mutableStateOf("") }
+    var unitB by remember { mutableStateOf("oz") }
+    var expandedB by remember { mutableStateOf(false) }
+
+    LaunchedEffect(scannedA) {
+        if (scannedA != null) {
+            val (n, q) = vm.fetchProduct(scannedA)
+            if (n != null) nameA = n
+            parseQuantityAndUnit(q ?: "", unitsList)?.let { qtyA = it.first; unitA = it.second }
+            onClearA()
+        }
+    }
+    LaunchedEffect(scannedB) {
+        if (scannedB != null) {
+            val (n, q) = vm.fetchProduct(scannedB)
+            if (n != null) nameB = n
+            parseQuantityAndUnit(q ?: "", unitsList)?.let { qtyB = it.first; unitB = it.second }
+            onClearB()
+        }
+    }
+
+    val upA = getPricePerOz(priceA.toDoubleOrNull() ?: 0.0, qtyA.toDoubleOrNull() ?: 0.0, unitA)
+    val upB = getPricePerOz(priceB.toDoubleOrNull() ?: 0.0, qtyB.toDoubleOrNull() ?: 0.0, unitB)
+
+    Scaffold(topBar = { TopAppBar(title = { Text("Compare Tool") }, navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back") } }) }) { p ->
+        LazyColumn(modifier = Modifier.fillMaxSize().padding(p).padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("Item A", fontWeight = FontWeight.Bold)
+                            IconButton(onClick = { onScan("compareA") }) { Icon(Icons.Default.Search, null) }
+                        }
+                        OutlinedTextField(nameA, { nameA = it }, label = { Text("Name") }, modifier = Modifier.fillMaxWidth())
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(priceA, { priceA = it }, label = { Text("$ Price") }, modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                            OutlinedTextField(qtyA, { qtyA = it }, label = { Text("Qty") }, modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                            Box(modifier = Modifier.weight(1f)) {
+                                OutlinedTextField(unitA, {}, readOnly = true, label = { Text("Unit") }, trailingIcon = { Icon(Icons.Default.ArrowDropDown, null, Modifier.clickable { expandedA = true }) })
+                                Box(modifier = Modifier.matchParentSize().clickable { expandedA = true })
+                                DropdownMenu(expanded = expandedA, onDismissRequest = { expandedA = false }) {
+                                    unitsList.forEach { u -> DropdownMenuItem(text = { Text(u) }, onClick = { unitA = u; expandedA = false }) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Text("Item B", fontWeight = FontWeight.Bold)
+                            IconButton(onClick = { onScan("compareB") }) { Icon(Icons.Default.Search, null) }
+                        }
+                        OutlinedTextField(nameB, { nameB = it }, label = { Text("Name") }, modifier = Modifier.fillMaxWidth())
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(priceB, { priceB = it }, label = { Text("$ Price") }, modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                            OutlinedTextField(qtyB, { qtyB = it }, label = { Text("Qty") }, modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                            Box(modifier = Modifier.weight(1f)) {
+                                OutlinedTextField(unitB, {}, readOnly = true, label = { Text("Unit") }, trailingIcon = { Icon(Icons.Default.ArrowDropDown, null, Modifier.clickable { expandedB = true }) })
+                                Box(modifier = Modifier.matchParentSize().clickable { expandedB = true })
+                                DropdownMenu(expanded = expandedB, onDismissRequest = { expandedB = false }) {
+                                    unitsList.forEach { u -> DropdownMenuItem(text = { Text(u) }, onClick = { unitB = u; expandedB = false }) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (upA > 0 && upB > 0) {
+                item {
+                    val isTie = Math.abs(upA - upB) < 0.0001
+                    val winIsA = upA < upB
+                    val winVal = if (winIsA) upA else upB
+                    val loseVal = if (winIsA) upB else upA
+                    val winName = if (winIsA) (nameA.ifBlank { "Item A" }) else (nameB.ifBlank { "Item B" })
+                    val loseName = if (winIsA) (nameB.ifBlank { "Item B" }) else (nameA.ifBlank { "Item A" })
+                    val diff = ((loseVal - winVal) / loseVal) * 100
+
+                    Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = if (isTie) Color.LightGray else Color(0xFFE8F5E9))) {
+                        Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            if (isTie) {
+                                Text("It's a Tie!", fontWeight = FontWeight.Bold)
+                                Text("$${String.format("%.3f", upA)} per unit", style = MaterialTheme.typography.bodyLarge)
+                            } else {
+                                Text("🏆 $winName is cheaper!", fontWeight = FontWeight.Bold, color = Color(0xFF2E7D32), fontSize = 18.sp)
+                                Spacer(Modifier.height(8.dp))
+                                Text("$winName costs $${String.format("%.3f", winVal)} vs $${String.format("%.3f", loseVal)} for $loseName.", textAlign = TextAlign.Center, style = MaterialTheme.typography.bodyMedium)
+                                Text("Saving ${String.format("%.1f", diff)}%", color = Color(0xFF2E7D32), fontWeight = FontWeight.ExtraBold)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun EntryScreen(navController: NavHostController, vm: PriceViewModel, scannedCode: String?, entryId: Int, onClear: () -> Unit, onLaunchScanner: () -> Unit) {
+    var name by remember { mutableStateOf("") }; var priceInput by remember { mutableStateOf("") }; var qtyInput by remember { mutableStateOf("") }
+    var unit by remember { mutableStateOf("oz") }; var store by remember { mutableStateOf(vm.lastUsedStore) }; var barcode by remember { mutableStateOf<String?>(null) }
+    var unitMenuExpanded by remember { mutableStateOf(false) }; var showSuggestions by remember { mutableStateOf(false) }
+
+    val history by vm.getHistoryForProduct(name).collectAsState(initial = emptyList())
+    val suggestions by vm.getSuggestedNames(name).collectAsState(initial = emptyList())
+    val dateState = rememberDatePickerState(initialSelectedDateMillis = System.currentTimeMillis())
+    val units = listOf("oz", "lb", "g", "kg", "ml", "l", "gal", "count", "pack")
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(entryId) { if (entryId != 0) vm.getEntryById(entryId)?.let { name = it.name; priceInput = it.totalPrice.toString(); qtyInput = it.quantity.toString(); unit = it.unit; barcode = it.barcode; store = it.store } }
+
+    LaunchedEffect(scannedCode) {
+        if (scannedCode != null) {
+            barcode = scannedCode
+            scope.launch {
+                val localMatch = vm.getLastEntryForName(scannedCode)
+                if (localMatch != null) {
+                    name = localMatch.name
+                    unit = localMatch.unit
+                    qtyInput = localMatch.quantity.toString()
+                } else {
+                    val (n, q) = vm.fetchProduct(scannedCode)
+                    if (n != null) name = n
+                    parseQuantityAndUnit(q ?: "", units)?.let { qtyInput = it.first; unit = it.second }
+                }
+            }
+            onClear()
+        }
+    }
+
+    Scaffold(topBar = { TopAppBar(title = { Text("Log Price") }, navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back") } }) }) { p ->
+        LazyColumn(modifier = Modifier.fillMaxSize().padding(p).padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            item { Button(onClick = onLaunchScanner, modifier = Modifier.fillMaxWidth()) { Icon(imageVector = Icons.Default.Search, contentDescription = "Scan"); Text("Scan Barcode") } }
+
+            // --- LIVE PRICE CONTEXT CARD ---
+            if (name.length > 1 && history.isNotEmpty()) {
+                item {
+                    val historicalUnitPrices = history.map { getPricePerOz(it.totalPrice, it.quantity, it.unit) }
+                    val lowPrice = historicalUnitPrices.minOrNull() ?: 0.0
+                    val highPrice = historicalUnitPrices.maxOrNull() ?: 0.0
+                    val medPrice = calculateMedian(historicalUnitPrices)
+                    val currentPriceOz = getPricePerOz(priceInput.toDoubleOrNull() ?: 0.0, qtyInput.toDoubleOrNull() ?: 0.0, unit)
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                    ) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("Real-Time Price Context", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                            Spacer(Modifier.height(4.dp))
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("Records: ${history.size}", style = MaterialTheme.typography.bodySmall)
+                                Text("Median: $${String.format("%.2f", medPrice)}/oz", style = MaterialTheme.typography.bodySmall)
+                            }
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("Low: $${String.format("%.2f", lowPrice)}/oz", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = Color(0xFF2E7D32))
+                                Text("High: $${String.format("%.2f", highPrice)}/oz", style = MaterialTheme.typography.bodySmall)
+                            }
+
+                            if (currentPriceOz > 0) {
+                                Divider(Modifier.padding(vertical = 8.dp))
+                                val isBest = currentPriceOz < (lowPrice + 0.001)
+                                val diffPercent = if (medPrice > 0) ((currentPriceOz - medPrice) / medPrice) * 100 else 0.0
+
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        if (isBest) "🌟 NEW BEST PRICE!"
+                                        else if (currentPriceOz <= medPrice) "👍 Better than Median"
+                                        else "⚠️ Higher than Median",
+                                        fontWeight = FontWeight.Bold,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = if (isBest || currentPriceOz <= medPrice) Color(0xFF2E7D32) else Color.Red
+                                    )
+                                }
+                                if (!isBest) {
+                                    Text(
+                                        "${String.format("%.1f", Math.abs(diffPercent))}% ${if (diffPercent > 0) "higher" else "lower"} than median.",
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            item { OutlinedTextField(store, { store = it }, label = { Text("Store") }, modifier = Modifier.fillMaxWidth()) }
+            item {
+                Box {
+                    OutlinedTextField(name, { name = it; showSuggestions = it.isNotEmpty() }, label = { Text("Product Name") }, modifier = Modifier.fillMaxWidth())
+                    if (showSuggestions && suggestions.isNotEmpty()) {
+                        DropdownMenu(expanded = showSuggestions, onDismissRequest = { showSuggestions = false }, properties = PopupProperties(focusable = false)) {
+                            suggestions.forEach { s ->
+                                DropdownMenuItem(
+                                    text = { Text(s) },
+                                    onClick = {
+                                        name = s
+                                        showSuggestions = false
+                                        scope.launch {
+                                            vm.getLastEntryForName(s)?.let { lastEntry ->
+                                                unit = lastEntry.unit
+                                                qtyInput = lastEntry.quantity.toString()
+                                                barcode = lastEntry.barcode
+                                            }
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(priceInput, { priceInput = it }, label = { Text("Price $") }, modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                    OutlinedTextField(qtyInput, { qtyInput = it }, label = { Text("Size") }, modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                }
+            }
+            item {
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(unit, {}, readOnly = true, label = { Text("Unit") }, modifier = Modifier.fillMaxWidth(), trailingIcon = { Icon(imageVector = Icons.Default.ArrowDropDown, contentDescription = "Units", modifier = Modifier.clickable { unitMenuExpanded = true }) })
+                    Box(modifier = Modifier.matchParentSize().clickable { unitMenuExpanded = true })
+                    DropdownMenu(expanded = unitMenuExpanded, onDismissRequest = { unitMenuExpanded = false }) { units.forEach { u -> DropdownMenuItem(text = { Text(u) }, onClick = { unit = u; unitMenuExpanded = false }) } }
+                }
+            }
+            item { Button(onClick = { if (name.isNotBlank() && priceInput.isNotBlank()) { vm.saveOrUpdatePrice(entryId, name, priceInput, qtyInput, unit, dateState.selectedDateMillis ?: 0, barcode, store); navController.popBackStack() } }, modifier = Modifier.fillMaxWidth().height(60.dp)) { Text("Save") } }
+        }
+    }
+}
+
+@Composable
+fun ScannerScreen(onScanned: (String) -> Unit) {
+    val context = LocalContext.current; val lifecycleOwner = LocalLifecycleOwner.current
+    var hasPermission by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { hasPermission = it }
+    var detected by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { if (!hasPermission) launcher.launch(Manifest.permission.CAMERA) }
+    if (hasPermission) {
+        AndroidView(factory = { ctx ->
+            val previewView = PreviewView(ctx)
+            ProcessCameraProvider.getInstance(ctx).addListener({
+                val provider = ProcessCameraProvider.getInstance(ctx).get()
+                val preview = Preview.Builder().build().apply { setSurfaceProvider(previewView.surfaceProvider) }
+                val analysis = ImageAnalysis.Builder().setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
+                analysis.setAnalyzer(Executors.newSingleThreadExecutor()) { proxy ->
+                    proxy.image?.let { mediaImage ->
+                        BarcodeScanning.getClient().process(InputImage.fromMediaImage(mediaImage, proxy.imageInfo.rotationDegrees))
+                            .addOnSuccessListener { barcodes -> if (barcodes.isNotEmpty() && !detected) { detected = true; barcodes[0].rawValue?.let { onScanned(it) } } }
+                            .addOnCompleteListener { proxy.close() }
+                    } ?: proxy.close()
+                }
+                provider.unbindAll(); provider.bindToLifecycle(lifecycleOwner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+            }, ContextCompat.getMainExecutor(ctx))
+            previewView
+        }, modifier = Modifier.fillMaxSize())
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun OptionsScreen(navController: NavHostController, vm: PriceViewModel) {
+    val history by vm.filteredPrices.collectAsState(initial = emptyList())
+    var query by remember { mutableStateOf("") }
+    var showDeleteAllConfirm by remember { mutableStateOf(false) }
+
+    if (showDeleteAllConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteAllConfirm = false },
+            title = { Text("Delete All Records") },
+            text = { Text("Are you sure you want to wipe all price history? This cannot be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.deleteAllPrices()
+                    showDeleteAllConfirm = false
+                }) { Text("Delete All", color = Color.Red) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteAllConfirm = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("History") },
+                navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back") } },
+                actions = {
+                    if (history.isNotEmpty()) {
+                        TextButton(onClick = { showDeleteAllConfirm = true }) {
+                            Text("Clear All", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
+            )
+        }
+    ) { p ->
+        Column(modifier = Modifier.padding(p)) {
+            OutlinedTextField(query, { query = it; vm.setSearchQuery(it) }, modifier = Modifier.fillMaxWidth().padding(16.dp), placeholder = { Text("Search history...") })
+            LazyColumn {
+                items(history) { entry ->
+                    ListItem(
+                        headlineContent = { Text(entry.name) },
+                        supportingContent = { Text("$${String.format("%.2f", entry.totalPrice)} at ${entry.store} (${entry.quantity} ${entry.unit})") },
+                        trailingContent = {
+                            Row {
+                                IconButton(onClick = { navController.navigate("chart/${entry.name}") }) {
+                                    Icon(imageVector = Icons.Default.List, contentDescription = "Trend")
+                                }
+                                IconButton(onClick = { vm.deletePrice(entry) }) {
+                                    Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = Color.Red)
+                                }
+                            }
+                        },
+                        modifier = Modifier.clickable { navController.navigate("entry?entryId=${entry.id}") }
+                    )
+                    HorizontalDivider()
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun PriceChartScreen(navController: NavHostController, vm: PriceViewModel, productName: String) {
+    val history by vm.getHistoryForProduct(productName).collectAsState(initial = emptyList())
+    Scaffold(topBar = {
+        TopAppBar(
+            title = { Text("Trend: $productName") },
+            navigationIcon = { IconButton(onClick = { navController.popBackStack() }) { Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back") } }
+        )
+    }) { p ->
+        Column(modifier = Modifier.padding(p).fillMaxSize().padding(16.dp)) {
+            if (history.size < 2) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Need at least 2 entries for a trend.") }
+            } else {
+                val unitPrices = history.map { getPricePerOz(it.totalPrice, it.quantity, it.unit) }
+                val high = unitPrices.maxOrNull() ?: 0.0
+                val low = unitPrices.minOrNull() ?: 0.0
+                val median = calculateMedian(unitPrices)
+                val count = history.size
+
+                Card(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
+                    Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column {
+                            Text("Entries: $count", style = MaterialTheme.typography.labelLarge)
+                            Text("Median: $${String.format("%.2f", median)}/oz", style = MaterialTheme.typography.labelLarge)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("High: $${String.format("%.2f", high)}/oz", style = MaterialTheme.typography.labelLarge)
+                            Text("Low: $${String.format("%.2f", low)}/oz", style = MaterialTheme.typography.labelLarge, color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+
+                Canvas(modifier = Modifier.fillMaxWidth().height(300.dp).background(Color.White)) {
+                    val lp = 100f
+                    val bp = 80f
+                    val tp = 40f
+                    val rp = 40f
+                    val cw = size.width - lp - rp
+                    val ch = size.height - tp - bp
+
+                    val maxP = high.toFloat()
+                    val minP = low.toFloat()
+                    val range = if (maxP - minP == 0f) 1f else maxP - minP
+
+                    drawLine(Color.Black, Offset(lp, tp), Offset(lp, size.height - bp), 2f)
+                    drawLine(Color.Black, Offset(lp, size.height - bp), Offset(size.width - rp, size.height - bp), 2f)
+
+                    val paint = Paint().apply {
+                        color = android.graphics.Color.BLACK
+                        textSize = 30f
+                        typeface = Typeface.DEFAULT_BOLD
+                    }
+
+                    for (i in 0..4) {
+                        val priceLabel = minP + (range / 4 * i)
+                        val y = (size.height - bp) - (i.toFloat() / 4 * ch)
+                        drawContext.canvas.nativeCanvas.drawText("$${String.format("%.2f", priceLabel)}", 10f, y + 10f, paint)
+                    }
+
+                    val spacing = cw / (history.size - 1)
+                    val points = history.mapIndexed { i, entry ->
+                        val up = getPricePerOz(entry.totalPrice, entry.quantity, entry.unit).toFloat()
+                        val x = lp + (i * spacing)
+                        val y = (size.height - bp) - ((up - minP) / range * ch)
+                        val dateStr = SimpleDateFormat("MM/dd", Locale.getDefault()).format(Date(entry.date))
+                        drawContext.canvas.nativeCanvas.drawText(dateStr, x - 30f, size.height - 20f, paint)
+                        Offset(x, y)
+                    }
+
+                    val path = ComposePath().apply {
+                        moveTo(points[0].x, points[0].y)
+                        points.forEach { lineTo(it.x, it.y) }
+                    }
+                    drawPath(path, Color(0xFF2196F3), style = Stroke(4.dp.toPx()))
+                    points.forEach { drawCircle(Color(0xFF1976D2), 6.dp.toPx(), it) }
+                }
+            }
+        }
+    }
+}

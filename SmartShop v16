@@ -135,13 +135,28 @@ fun computeItemNameCounts(entries: List<PriceEntry>): List<ItemNameCount> =
         ItemNameCount(canonicalLabel(list.map { it.name }), list.size)
     }
 
+private val statDayKeyFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+private val statDayDisplayFormat = SimpleDateFormat("MM/dd/yy", Locale.getDefault())
+
+fun dayKey(dateMillis: Long): String = statDayKeyFormat.format(Date(dateMillis))
+
+fun dayDisplayFromKey(dayKey: String): String =
+    runCatching { statDayDisplayFormat.format(statDayKeyFormat.parse(dayKey)!!) }.getOrDefault(dayKey)
+
+data class DateCount(val dayKey: String, val displayDate: String, val itemCount: Int)
+
+fun computeDateCounts(entries: List<PriceEntry>): List<DateCount> =
+    entries.groupBy { dayKey(it.date) }.map { (key, list) ->
+        DateCount(key, statDayDisplayFormat.format(Date(list.first().date)), list.size)
+    }
+
 data class StatAvgRow(val label: String, val avgPricePerOz: Double, val entryCount: Int)
 
 data class PriceChangeRow(
     val name: String,
     val category: String,
     val latestPricePerOz: Double,
-    val medianPricePerOz: Double,
+    val avgPricePerOz: Double,
     val pctChange: Double,
     val entryCount: Int,
 )
@@ -155,6 +170,7 @@ fun filterEntriesForStat(entries: List<PriceEntry>, filterType: String, filterVa
         "NAME" -> entries.filter { normalizeNameKey(it.name) == normalizeNameKey(filterValue) }
         "PRODUCT" -> entries.filter { normalizeNameKey(it.name) == normalizeNameKey(filterValue) && normalizeCategoryKey(it.category) == normalizeCategoryKey(filterSecondary) }
         "DUPLICATE" -> entries.filter { normalizeProductName(it.name) == filterValue }
+        "DATE" -> entries.filter { dayKey(it.date) == filterValue }
         else -> emptyList()
     }
 
@@ -164,6 +180,7 @@ fun statEntryScreenTitle(filterType: String, filterValue: String, filterSecondar
     "NAME" -> filterValue.ifBlank { "(Unnamed)" }
     "PRODUCT" -> if (filterSecondary.isNotBlank()) "$filterValue ($filterSecondary)" else filterValue
     "DUPLICATE" -> "Similar names"
+    "DATE" -> dayDisplayFromKey(filterValue)
     else -> "Entries"
 }
 
@@ -199,10 +216,10 @@ fun computePriceChanges(entries: List<PriceEntry>): List<PriceChangeRow> =
         .map { list ->
             val sorted = list.sortedBy { it.date }
             val unitPrices = list.map { getPricePerOz(it.totalPrice, it.quantity, it.unit) }.filter { it > 0 }
-            val median = calculateMedian(unitPrices)
+            val average = if (unitPrices.isEmpty()) 0.0 else unitPrices.average()
             val latest = getPricePerOz(sorted.last().totalPrice, sorted.last().quantity, sorted.last().unit)
-            val pct = if (median > 0) ((latest - median) / median) * 100.0 else 0.0
-            PriceChangeRow(sorted.last().name, sorted.last().category, latest, median, pct, list.size)
+            val pct = if (average > 0) ((latest - average) / average) * 100.0 else 0.0
+            PriceChangeRow(sorted.last().name, sorted.last().category, latest, average, pct, list.size)
         }
 
 fun computePossibleDuplicates(entries: List<PriceEntry>): List<DuplicateGroupRow> =
@@ -426,6 +443,7 @@ class MainActivity : ComponentActivity() {
                     composable("stats/categories") { CategoryStatsScreen(navController, vm) }
                     composable("stats/stores") { StoreStatsScreen(navController, vm) }
                     composable("stats/items") { ItemStatsScreen(navController, vm) }
+                    composable("stats/dates") { DateStatsScreen(navController, vm) }
                     composable("stats/avg-category") { AvgPriceByCategoryScreen(navController, vm) }
                     composable("stats/avg-store") { AvgPriceByStoreScreen(navController, vm) }
                     composable("stats/price-changes") { PriceChangeStatsScreen(navController, vm) }
@@ -710,6 +728,15 @@ fun StatsScreen(navController: NavHostController, vm: PriceViewModel) {
             }
             item {
                 ListItem(
+                    headlineContent = { Text("By Date") },
+                    supportingContent = { Text("Entry counts by shopping date") },
+                    leadingContent = { Icon(Icons.Default.DateRange, null) },
+                    modifier = Modifier.clickable { navController.navigate("stats/dates") }
+                )
+                HorizontalDivider()
+            }
+            item {
+                ListItem(
                     headlineContent = { Text("Avg $/oz by Category") },
                     supportingContent = { Text("Average unit price per category") },
                     leadingContent = { Icon(Icons.Default.List, null) },
@@ -729,7 +756,7 @@ fun StatsScreen(navController: NavHostController, vm: PriceViewModel) {
             item {
                 ListItem(
                     headlineContent = { Text("Price Changes") },
-                    supportingContent = { Text("Latest price vs your median per item") },
+                    supportingContent = { Text("Latest price vs your average per item") },
                     leadingContent = { Icon(Icons.Default.Refresh, null) },
                     modifier = Modifier.clickable { navController.navigate("stats/price-changes") }
                 )
@@ -754,6 +781,7 @@ private data class StatCountRow(
     val filterType: String,
     val filterValue: String,
     val filterSecondary: String = "",
+    val labelSortKey: String = label.lowercase(),
 )
 
 private enum class StatSortColumn { LABEL, COUNT }
@@ -768,15 +796,18 @@ private fun SortableCountTableScreen(
     countHeader: String = "Items",
     rows: List<StatCountRow>,
     blankLabel: String = "(None)",
+    defaultSort: StatSortColumn = StatSortColumn.COUNT,
+    defaultDescending: Boolean = true,
+    labelSortDescendingFirst: Boolean = false,
 ) {
-    var sortColumn by remember { mutableStateOf(StatSortColumn.COUNT) }
-    var sortDirection by remember { mutableStateOf(SortDirection.DESC) }
+    var sortColumn by remember { mutableStateOf(defaultSort) }
+    var sortDirection by remember { mutableStateOf(if (defaultDescending) SortDirection.DESC else SortDirection.ASC) }
 
     val sortedRows = remember(rows, sortColumn, sortDirection) {
         when (sortColumn) {
             StatSortColumn.LABEL -> when (sortDirection) {
-                SortDirection.ASC -> rows.sortedBy { it.label.lowercase() }
-                SortDirection.DESC -> rows.sortedByDescending { it.label.lowercase() }
+                SortDirection.ASC -> rows.sortedBy { it.labelSortKey }
+                SortDirection.DESC -> rows.sortedByDescending { it.labelSortKey }
             }
             StatSortColumn.COUNT -> when (sortDirection) {
                 SortDirection.ASC -> rows.sortedBy { it.count }
@@ -790,7 +821,11 @@ private fun SortableCountTableScreen(
             sortDirection = if (sortDirection == SortDirection.ASC) SortDirection.DESC else SortDirection.ASC
         } else {
             sortColumn = column
-            sortDirection = if (column == StatSortColumn.LABEL) SortDirection.ASC else SortDirection.DESC
+            sortDirection = when {
+                column == StatSortColumn.LABEL && labelSortDescendingFirst -> SortDirection.DESC
+                column == StatSortColumn.LABEL -> SortDirection.ASC
+                else -> SortDirection.DESC
+            }
         }
     }
 
@@ -905,6 +940,29 @@ fun ItemStatsScreen(navController: NavHostController, vm: PriceViewModel) {
         labelHeader = "Item",
         rows = rows.map { StatCountRow(it.name, it.itemCount, "NAME", it.name) },
         blankLabel = "(Unnamed)"
+    )
+}
+
+@Composable
+fun DateStatsScreen(navController: NavHostController, vm: PriceViewModel) {
+    val prices by vm.getAllPrices().collectAsState(initial = emptyList())
+    val rows = remember(prices) { computeDateCounts(prices) }
+    SortableCountTableScreen(
+        navController = navController,
+        title = "By Date",
+        labelHeader = "Date",
+        rows = rows.map {
+            StatCountRow(
+                label = it.displayDate,
+                count = it.itemCount,
+                filterType = "DATE",
+                filterValue = it.dayKey,
+                labelSortKey = it.dayKey,
+            )
+        },
+        defaultSort = StatSortColumn.LABEL,
+        defaultDescending = true,
+        labelSortDescendingFirst = true,
     )
 }
 
@@ -1103,7 +1161,7 @@ fun PriceChangeStatsScreen(navController: NavHostController, vm: PriceViewModel)
             StatDetailRow(
                 label = it.name,
                 value = "$sign${String.format("%.1f", it.pctChange)}%",
-                detail = "${it.category} · $${String.format("%.2f", it.latestPricePerOz)}/oz vs $${String.format("%.2f", it.medianPricePerOz)}/oz median · ${it.entryCount} entries",
+                detail = "${it.category} · $${String.format("%.2f", it.latestPricePerOz)}/oz vs $${String.format("%.2f", it.avgPricePerOz)}/oz avg · ${it.entryCount} entries",
                 sortValue = it.pctChange,
                 filterType = "PRODUCT",
                 filterValue = it.name,
@@ -1115,7 +1173,7 @@ fun PriceChangeStatsScreen(navController: NavHostController, vm: PriceViewModel)
         navController = navController,
         title = "Price Changes",
         labelHeader = "Item",
-        valueHeader = "vs Median",
+        valueHeader = "vs Avg",
         rows = rows,
         emptyMessage = "Need at least 2 entries per item to compare prices.",
         valueColor = { row ->
